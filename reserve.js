@@ -234,6 +234,54 @@ const bookSlot = async (targetText, targetDate, userProfile) => {
     return success;
 };
 
+const notifyWhatsApp = async (message) => {
+    console.log(`\n[${new Date().toISOString()}] Sending WhatsApp notification to "Pickleball" group...`);
+    const browser = await puppeteer.launch({
+        headless: false, // Needs to be visible for first-time QR scan
+        userDataDir: './chrome_profile', // Persist session
+        defaultViewport: null,
+        args: ['--start-maximized']
+    });
+
+    try {
+        const page = await browser.newPage();
+        console.log("Navigating to WhatsApp Web...");
+        await page.goto('https://web.whatsapp.com', { waitUntil: 'networkidle2' });
+
+        console.log("Waiting for WhatsApp Web to load (Please scan QR code if first time)...");
+        // Wait for search box to appear (indicates we are logged in)
+        await page.waitForSelector('div[contenteditable="true"]', { timeout: 120000 }); // 2 min timeout for QR scan
+
+        console.log("Searching for 'Pickleball' group...");
+        const searchBox = await page.$('div[contenteditable="true"]');
+        await searchBox.click();
+
+        await page.keyboard.type('Pickleball', { delay: 100 });
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Press Enter to open the group chat
+        await page.keyboard.press('Enter');
+        await new Promise(r => setTimeout(r, 2000));
+
+        console.log("Typing message...");
+        // Pressing enter on search puts focus on the chat input box naturally
+        await page.keyboard.type(message, { delay: 50 });
+        await new Promise(r => setTimeout(r, 1000));
+
+        // Press Enter to send
+        await page.keyboard.press('Enter');
+        console.log("✅ WhatsApp Message sent!");
+
+        // Wait to ensure message actually sends
+        await new Promise(r => setTimeout(r, 5000));
+
+    } catch (e) {
+        console.error("❌ Failed to send WhatsApp notification:", e);
+    } finally {
+        await browser.close();
+    }
+};
+
 const runScheduler = async () => {
     console.log('--- Amenity Automation Service Started ---');
     console.log(`Monitoring for ${TARGETS.length} slots...`);
@@ -287,6 +335,11 @@ const runScheduler = async () => {
 
                 if (booked) {
                     console.log(`✅ Successfully booked ${targetToBook.target.label}`);
+
+                    // Trigger WhatsApp Notification
+                    const message = `✅ Successfully booked the Pickleball court for ${targetToBook.target.label} (booked under ${userProfile.name})!`;
+                    await notifyWhatsApp(message);
+
                 } else {
                     console.log(`❌ Failed to book ${targetToBook.target.label}. Rolling over to next slot.`);
                 }
