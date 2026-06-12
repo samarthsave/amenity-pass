@@ -49,7 +49,7 @@ const AMENITY_URL = 'https://amenitypass.app/properties/6581p8950s37s52a3p2t0w44
     }
 
     console.log(`\n>>> Booking "${match.label}" under user ${match.user} (${USERS[match.user].name}) <<<\n`);
-    const ok = await bookSlot(match.label, new Date(), USERS[match.user]);
-    console.log(`\nTEST RESULT: ${ok ? 'BOOKED ' + match.label : 'FAILED to book ' + match.label}`);
-    process.exit(ok ? 0 : 1);
+    const result = await bookSlot(match.label, new Date(), USERS[match.user]);
+    console.log(`\nTEST RESULT: ${result.success ? 'BOOKED ' + match.label : 'FAILED to book ' + match.label + ' (' + (result.message || 'unknown') + ')'}`);
+    process.exit(result.success ? 0 : 1);
 })().catch(e => { console.error('TEST ERROR:', e); process.exit(1); });

@@ -1,6 +1,26 @@
 const fs = require('fs');
 require('dotenv').config();
 const puppeteer = require('puppeteer');
+const nodemailer = require('nodemailer');
+
+// Email notifications via Gmail SMTP. Set GMAIL_USER + GMAIL_APP_PASSWORD in .env
+// (the app password is generated at https://myaccount.google.com/apppasswords, requires 2FA).
+const GMAIL_USER = process.env.GMAIL_USER;
+const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
+const NOTIFY_TO = process.env.NOTIFY_TO || GMAIL_USER;
+const mailer = (GMAIL_USER && GMAIL_APP_PASSWORD)
+    ? nodemailer.createTransport({ service: 'gmail', auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD } })
+    : null;
+
+const sendEmail = async (subject, body) => {
+    if (!mailer) { console.log('Email not configured (set GMAIL_USER/GMAIL_APP_PASSWORD) — skipping notification.'); return; }
+    try {
+        await mailer.sendMail({ from: GMAIL_USER, to: NOTIFY_TO, subject, text: body });
+        console.log(`📧 Email sent: ${subject}`);
+    } catch (e) {
+        console.log(`Email notification failed: ${e.message}`);
+    }
+};
 
 const AMENITY_URL = 'https://amenitypass.app/properties/6581p8950s37s52a3p2t0w44gg/amenities/yt9198emjd193dbkydz0y93edm';
 
@@ -273,10 +293,11 @@ const bookSlot = async (targetText, targetDate, userProfile) => {
 
     } catch (err) {
         console.error('Booking failed:', err);
+        if (!rejectionMessage) rejectionMessage = err.message;
     } finally {
         await browser.close();
     }
-    return success;
+    return { success, message: rejectionMessage };
 };
 
 const runScheduler = async () => {
@@ -324,16 +345,25 @@ const runScheduler = async () => {
                 const userProfile = USERS[userKey];
 
                 console.log(`\n[${new Date().toISOString()}] Launching for "${targetToBook.target.label}" (User: ${userKey}) (Opens 48h prior)...`);
-                const booked = await bookSlot(targetToBook.target.label, targetToBook.slotTime, userProfile);
+                const result = await bookSlot(targetToBook.target.label, targetToBook.slotTime, userProfile);
 
-                // Regardless of success or failure, we mark this slot as processed 
+                // Regardless of success or failure, we mark this slot as processed
                 // so we don't keep trying it forever and can move to the next one (rollover).
                 successfulBookings.add(targetToBook.slotKey);
 
-                if (booked) {
-                    console.log(`✅ Successfully booked ${targetToBook.target.label} (booked under ${userProfile.name})`);
+                const label = targetToBook.target.label;
+                if (result.success) {
+                    console.log(`✅ Successfully booked ${label} (booked under ${userProfile.name})`);
+                    await sendEmail(
+                        `✅ Booked: ${label} (${userProfile.name})`,
+                        `Booked the Pickleball court.\n\nSlot: ${label}\nUser: ${userProfile.name} (condo ${userProfile.condo})\nWhen: ${new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`
+                    );
                 } else {
-                    console.log(`❌ Failed to book ${targetToBook.target.label}. Rolling over to next slot.`);
+                    console.log(`❌ Failed to book ${label}. Rolling over to next slot.`);
+                    await sendEmail(
+                        `⚠️ Booking FAILED: ${label} (${userProfile.name})`,
+                        `Could not book the Pickleball court — you may want to grab it manually.\n\nSlot: ${label}\nUser: ${userProfile.name} (condo ${userProfile.condo})\nReason: ${result.message || 'slot unavailable / not found'}\nWhen: ${new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`
+                    );
                 }
             } else {
                 // Wait logic
