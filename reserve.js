@@ -66,10 +66,36 @@ const bookSlot = async (targetText, targetDate, userProfile) => {
     const browser = await puppeteer.launch({
         headless: false,
         defaultViewport: null,
-        args: ['--start-maximized']
+        // protocolTimeout guards against a slow renderer stalling CDP calls on small hosts.
+        protocolTimeout: 120000,
+        // --no-sandbox: required on headless Linux servers (Ubuntu 24.04 restricts Chrome's
+        //   user-namespace sandbox via AppArmor). Safe here: we only load our own site.
+        // --disable-dev-shm-usage: /dev/shm is tiny on small/cloud hosts; use /tmp instead so
+        //   the renderer doesn't crash/hang during heavy steps like "Get Pass".
+        args: ['--start-maximized', '--no-sandbox', '--disable-setuid-sandbox',
+               '--disable-dev-shm-usage', '--disable-gpu']
     });
     const page = await browser.newPage();
     let success = false;
+
+    // The site signals a rejected booking with a native alert() (e.g. "Not enough time
+    // remaining, Condo X limited to 1 hour per day"). An unhandled dialog freezes the
+    // renderer and hangs every subsequent call, so we must dismiss it and record the message.
+    let rejectionMessage = null;
+    page.on('dialog', async (dialog) => {
+        rejectionMessage = dialog.message();
+        console.log(`Site dialog (${dialog.type()}): ${dialog.message()}`);
+        try { await dialog.dismiss(); } catch (e) { /* dialog may already be gone */ }
+    });
+
+    // The booking is confirmed/denied via a POST to the permits API. Capture its status as a
+    // reliable success signal (2xx = booked, 409/4xx = denied) independent of UI rendering.
+    let permitStatus = null;
+    page.on('response', (res) => {
+        if (/\/permits?(\/|\?)/i.test(res.url()) && res.request().method() === 'POST') {
+            permitStatus = res.status();
+        }
+    });
 
     try {
         console.log(`Navigating to ${AMENITY_URL}`);
@@ -215,10 +241,29 @@ const bookSlot = async (targetText, targetDate, userProfile) => {
             });
 
             if (submitted) {
-                console.log('Submitted booking!');
-                await new Promise(r => setTimeout(r, 5000));
-                await page.screenshot({ path: `confirmation_${targetText.replace(/[: ]/g, '_')}.png` });
-                success = true;
+                console.log('Submitted booking! Waiting for server response...');
+                // Allow the permits API round-trip and any rejection alert() to land.
+                await new Promise(r => setTimeout(r, 6000));
+
+                if (rejectionMessage) {
+                    // Site rejected the booking (quota, slot taken, etc.) — not a real success.
+                    console.log(`❌ Booking rejected: "${rejectionMessage}"`);
+                    success = false;
+                } else if (permitStatus !== null && (permitStatus < 200 || permitStatus >= 300)) {
+                    console.log(`❌ Permit request returned HTTP ${permitStatus} — booking not confirmed.`);
+                    success = false;
+                } else {
+                    // No rejection dialog and permit POST succeeded (or no explicit status) → booked.
+                    success = true;
+                    console.log(`✅ Booking confirmed${permitStatus ? ` (HTTP ${permitStatus})` : ''}.`);
+                }
+
+                // Screenshot is best-effort evidence; never let it sink a real booking.
+                try {
+                    await page.screenshot({ path: `confirmation_${targetText.replace(/[: ]/g, '_')}.png` });
+                } catch (e) {
+                    console.log(`Screenshot skipped: ${e.message}`);
+                }
             } else {
                 console.log('Submit button not found.');
             }
@@ -232,54 +277,6 @@ const bookSlot = async (targetText, targetDate, userProfile) => {
         await browser.close();
     }
     return success;
-};
-
-const notifyWhatsApp = async (message) => {
-    console.log(`\n[${new Date().toISOString()}] Sending WhatsApp notification to "Pickleball" group...`);
-    const browser = await puppeteer.launch({
-        headless: false, // Needs to be visible for first-time QR scan
-        userDataDir: './chrome_profile', // Persist session
-        defaultViewport: null,
-        args: ['--start-maximized']
-    });
-
-    try {
-        const page = await browser.newPage();
-        console.log("Navigating to WhatsApp Web...");
-        await page.goto('https://web.whatsapp.com', { waitUntil: 'networkidle2' });
-
-        console.log("Waiting for WhatsApp Web to load (Please scan QR code if first time)...");
-        // Wait for search box to appear (indicates we are logged in)
-        await page.waitForSelector('div[contenteditable="true"]', { timeout: 120000 }); // 2 min timeout for QR scan
-
-        console.log("Searching for 'Pickleball' group...");
-        const searchBox = await page.$('div[contenteditable="true"]');
-        await searchBox.click();
-
-        await page.keyboard.type('Pickleball', { delay: 100 });
-        await new Promise(r => setTimeout(r, 2000));
-
-        // Press Enter to open the group chat
-        await page.keyboard.press('Enter');
-        await new Promise(r => setTimeout(r, 2000));
-
-        console.log("Typing message...");
-        // Pressing enter on search puts focus on the chat input box naturally
-        await page.keyboard.type(message, { delay: 50 });
-        await new Promise(r => setTimeout(r, 1000));
-
-        // Press Enter to send
-        await page.keyboard.press('Enter');
-        console.log("✅ WhatsApp Message sent!");
-
-        // Wait to ensure message actually sends
-        await new Promise(r => setTimeout(r, 5000));
-
-    } catch (e) {
-        console.error("❌ Failed to send WhatsApp notification:", e);
-    } finally {
-        await browser.close();
-    }
 };
 
 const runScheduler = async () => {
@@ -334,12 +331,7 @@ const runScheduler = async () => {
                 successfulBookings.add(targetToBook.slotKey);
 
                 if (booked) {
-                    console.log(`✅ Successfully booked ${targetToBook.target.label}`);
-
-                    // Trigger WhatsApp Notification
-                    const message = `✅ Successfully booked the Pickleball court for ${targetToBook.target.label} (booked under ${userProfile.name})!`;
-                    await notifyWhatsApp(message);
-
+                    console.log(`✅ Successfully booked ${targetToBook.target.label} (booked under ${userProfile.name})`);
                 } else {
                     console.log(`❌ Failed to book ${targetToBook.target.label}. Rolling over to next slot.`);
                 }
@@ -365,4 +357,8 @@ const runScheduler = async () => {
     }
 };
 
-runScheduler();
+if (require.main === module) {
+    runScheduler();
+}
+
+module.exports = { bookSlot, getNextOccurrence, runScheduler, USERS, TARGETS };

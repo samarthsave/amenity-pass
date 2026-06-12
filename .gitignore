@@ -3,4 +3,5 @@ node_modules/
 .DS_Store
 *.log
 debug_*.png
-confirmation_*.png
+confirmation*.png
+chrome_profile/
