@@ -125,7 +125,7 @@ const buildDayEventPayload = (slotTime) => {
         title: `Pickleball ${to12h(startMins)}–${to12h(endMins)}`,
         startsAt: `${dateStr}T${hhmm(startMins)}`, // local wall-clock, no timezone
         endsAt: `${dateStr}T${hhmm(endMins)}`,
-        location: 'Serrano Summit Pickleball Courts, Lake Forest, CA',
+        location: 'Serrano Summit Dr, Lake Forest, CA 92630',
         description,
         type: 'sports',
         sport: 'pickleball',
