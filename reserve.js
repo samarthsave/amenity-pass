@@ -2,6 +2,16 @@ const fs = require('fs');
 require('dotenv').config();
 const puppeteer = require('puppeteer');
 const nodemailer = require('nodemailer');
+const tribecove = require('./tribecove');
+
+// Prefix every log/error line with a timestamp so reserve.log is dated.
+['log', 'error'].forEach((method) => {
+    const original = console[method].bind(console);
+    console[method] = (...args) => {
+        const ts = new Date().toISOString();
+        original(`[${ts}]`, ...args);
+    };
+});
 
 // Email notifications via Gmail SMTP. Set GMAIL_USER + GMAIL_APP_PASSWORD in .env
 // (the app password is generated at https://myaccount.google.com/apppasswords, requires 2FA).
@@ -81,13 +91,57 @@ const getNextOccurrence = (dayOfWeek, hour, minute) => {
     return result;
 };
 
+// Build a single "whole-day block" TribeCove event payload for the day a slot
+// falls on. The block spans the earliest to latest TARGET slot for that weekday
+// (e.g. Sat/Sun 8:00–10:00 AM, Wed 6:00–8:00 PM), so 4 booked 30-min slots
+// collapse into one "Pickleball 8:00–10:00 AM" event. tribecove.createEvent
+// dedupes by title+startsAt, so only the day's first successful slot creates it.
+const buildDayEventPayload = (slotTime) => {
+    const pad = (n) => String(n).padStart(2, '0');
+    const daySlots = TARGETS.filter((t) => t.day === slotTime.getDay());
+    if (daySlots.length === 0) return null;
+    const minsOf = (t) => t.hour * 60 + t.minute;
+    const startMins = Math.min(...daySlots.map(minsOf));
+    const endMins = Math.max(...daySlots.map(minsOf)) + 30; // slots are 30 min
+    const dateStr = `${slotTime.getFullYear()}-${pad(slotTime.getMonth() + 1)}-${pad(slotTime.getDate())}`;
+    const hhmm = (mins) => `${pad(Math.floor(mins / 60))}:${pad(mins % 60)}`;
+    const to12h = (mins) => {
+        let h = Math.floor(mins / 60);
+        const m = mins % 60;
+        const ampm = h >= 12 ? 'PM' : 'AM';
+        h = h % 12 || 12;
+        return `${h}${m ? ':' + pad(m) : ''} ${ampm}`;
+    };
+    // One line per slot with the person it's booked under, e.g. "8:00 AM — sujay paranjape".
+    const slotLines = daySlots
+        .slice()
+        .sort((a, b) => minsOf(a) - minsOf(b))
+        .map((t) => {
+            const name = (USERS[t.user] && USERS[t.user].name) || t.user;
+            return `• ${to12h(minsOf(t))} — ${name}`;
+        });
+    const description = `Court reservations (auto-booked by the amenity bot):\n${slotLines.join('\n')}`;
+    return {
+        title: `Pickleball ${to12h(startMins)}–${to12h(endMins)}`,
+        startsAt: `${dateStr}T${hhmm(startMins)}`, // local wall-clock, no timezone
+        endsAt: `${dateStr}T${hhmm(endMins)}`,
+        location: 'Serrano Summit Pickleball Courts, Lake Forest, CA',
+        description,
+        type: 'sports',
+        sport: 'pickleball',
+    };
+};
+
 const bookSlot = async (targetText, targetDate, userProfile) => {
-    console.log(`\n[${new Date().toISOString()}] Starting booking process for: "${targetText}" using ${userProfile.name}`);
+    console.log(`\nStarting booking process for: "${targetText}" using ${userProfile.name}`);
     const browser = await puppeteer.launch({
         headless: false,
         defaultViewport: null,
         // protocolTimeout guards against a slow renderer stalling CDP calls on small hosts.
         protocolTimeout: 120000,
+        // Allow up to 60s for Chrome to start — a throttled/low-power machine can exceed
+        // the 30s default and throw "WS endpoint URL" timeouts.
+        timeout: 60000,
         // --no-sandbox: required on headless Linux servers (Ubuntu 24.04 restricts Chrome's
         //   user-namespace sandbox via AppArmor). Safe here: we only load our own site.
         // --disable-dev-shm-usage: /dev/shm is tiny on small/cloud hosts; use /tmp instead so
@@ -344,7 +398,7 @@ const runScheduler = async () => {
                 const userKey = targetToBook.target.user;
                 const userProfile = USERS[userKey];
 
-                console.log(`\n[${new Date().toISOString()}] Launching for "${targetToBook.target.label}" (User: ${userKey}) (Opens 48h prior)...`);
+                console.log(`\nLaunching for "${targetToBook.target.label}" (User: ${userKey}) (Opens 48h prior)...`);
                 const result = await bookSlot(targetToBook.target.label, targetToBook.slotTime, userProfile);
 
                 // Regardless of success or failure, we mark this slot as processed
@@ -354,6 +408,14 @@ const runScheduler = async () => {
                 const label = targetToBook.target.label;
                 if (result.success) {
                     console.log(`✅ Successfully booked ${label} (booked under ${userProfile.name})`);
+                    // Create one whole-day TribeCove event (deduped, so only the first
+                    // successful slot of the day posts it). No-op unless TRIBECOVE_ENABLED=1.
+                    try {
+                        const payload = buildDayEventPayload(targetToBook.slotTime);
+                        if (payload) await tribecove.createEvent(payload);
+                    } catch (e) {
+                        console.log(`[tribecove] hook error (booking unaffected): ${e.message}`);
+                    }
                     await sendEmail(
                         `✅ Booked: ${label} (${userProfile.name})`,
                         `Booked the Pickleball court.\n\nSlot: ${label}\nUser: ${userProfile.name} (condo ${userProfile.condo})\nWhen: ${new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' })}`
@@ -381,8 +443,10 @@ const runScheduler = async () => {
             }
 
         } catch (e) {
+            // Retry quickly (not 60s) so a transient launch failure can re-attempt while the
+            // ~2-minute booking window is still open instead of overshooting it.
             console.error('Fatal scheduler error:', e);
-            await new Promise(r => setTimeout(r, 60000));
+            await new Promise(r => setTimeout(r, 5000));
         }
     }
 };
@@ -391,4 +455,4 @@ if (require.main === module) {
     runScheduler();
 }
 
-module.exports = { bookSlot, getNextOccurrence, runScheduler, USERS, TARGETS };
+module.exports = { bookSlot, getNextOccurrence, runScheduler, buildDayEventPayload, USERS, TARGETS };
