@@ -68,7 +68,7 @@ const TARGETS = [
     { day: 0, hour: 9, minute: 0, label: "Sun 9:00 AM", user: "USER2" },
     { day: 0, hour: 9, minute: 30, label: "Sun 9:30 AM", user: "USER2" },
     { day: 3, hour: 19, minute: 0, label: "Wed 7:00 PM", user: "USER2" },
-    { day: 3, hour: 19, minute: 30, label: "Wed 7:30 PM", user: "USER2" }
+    { day: 3, hour: 19, minute: 30, label: "Wed 7:30 PM", user: "USER2", aggressive: true }
 ];
 
 // Cache to prevent re-booking same slot in same week
@@ -132,8 +132,14 @@ const buildDayEventPayload = (slotTime) => {
     };
 };
 
-const bookSlot = async (targetText, targetDate, userProfile) => {
-    console.log(`\nStarting booking process for: "${targetText}" using ${userProfile.name}`);
+const bookSlot = async (targetText, targetDate, userProfile, options = {}) => {
+    const aggressive = !!options.aggressive;
+    // Aggressive mode (contested slots like 7:30 PM): the scheduler launches this ~90s
+    // early so we are already loaded and polling when the slot opens, and we reload much
+    // faster to click the checkbox the instant a court frees up — ahead of other bots.
+    const INITIAL_WAIT_MS = aggressive ? 400 : 2000;
+    const RELOAD_WAIT_MS = aggressive ? 300 : 1500;
+    console.log(`\nStarting booking process for: "${targetText}" using ${userProfile.name}${aggressive ? ' [AGGRESSIVE]' : ''}`);
     const browser = await puppeteer.launch({
         headless: false,
         defaultViewport: null,
@@ -176,12 +182,14 @@ const bookSlot = async (targetText, targetDate, userProfile) => {
         await page.goto(AMENITY_URL, { waitUntil: 'networkidle2' });
 
         // Wait for initial load
-        await new Promise(r => setTimeout(r, 2000));
+        await new Promise(r => setTimeout(r, INITIAL_WAIT_MS));
 
         let foundSlot = false;
         let continueUrl = null;
         let retries = 0;
-        const maxRetries = 60; // Increased to cover pre-start + wait (60 * ~2s = ~2 mins)
+        // Normal: 60 * ~2s = ~2 min. Aggressive: fast reloads over a longer window so we
+        // cover the ~90s early start plus a couple of minutes after open (~320 * ~0.8s).
+        const maxRetries = aggressive ? 320 : 60;
 
         while (!foundSlot && retries < maxRetries) {
             try {
@@ -246,9 +254,12 @@ const bookSlot = async (targetText, targetDate, userProfile) => {
                 }
 
                 if (!foundSlot) {
-                    console.log(`Slot "${targetText}" not found. Reloading (${retries}/${maxRetries})...`);
+                    // Aggressive mode reloads very frequently; throttle the log so it stays readable.
+                    if (!aggressive || retries % 15 === 0) {
+                        console.log(`Slot "${targetText}" not found. Reloading (${retries}/${maxRetries})...`);
+                    }
                     await page.reload({ waitUntil: 'domcontentloaded' });
-                    await new Promise(r => setTimeout(r, 1500));
+                    await new Promise(r => setTimeout(r, RELOAD_WAIT_MS));
                 }
 
             } catch (e) {
@@ -370,10 +381,12 @@ const runScheduler = async () => {
                 // Booking opens 48 hours before
                 const openTime = new Date(slotTime.getTime() - (48 * 60 * 60 * 1000));
 
-                // Start 10 seconds BEFORE open time
-                const startTime = new Date(openTime.getTime() - 10000);
-                // Give up 2 minutes AFTER open time (rollover logic)
-                const giveUpTime = new Date(openTime.getTime() + 2 * 60000);
+                // Start before open time — aggressive (contested) slots start 90s early so the
+                // browser is already loaded and polling the moment a court frees; others 10s.
+                const leadMs = target.aggressive ? 90000 : 10000;
+                const startTime = new Date(openTime.getTime() - leadMs);
+                // Give up after open time (rollover logic) — a longer tail for aggressive slots.
+                const giveUpTime = new Date(openTime.getTime() + (target.aggressive ? 3 : 2) * 60000);
 
                 const slotKey = `${target.label}_${slotTime.toDateString()}`;
 
@@ -399,7 +412,7 @@ const runScheduler = async () => {
                 const userProfile = USERS[userKey];
 
                 console.log(`\nLaunching for "${targetToBook.target.label}" (User: ${userKey}) (Opens 48h prior)...`);
-                const result = await bookSlot(targetToBook.target.label, targetToBook.slotTime, userProfile);
+                const result = await bookSlot(targetToBook.target.label, targetToBook.slotTime, userProfile, { aggressive: targetToBook.target.aggressive });
 
                 // Regardless of success or failure, we mark this slot as processed
                 // so we don't keep trying it forever and can move to the next one (rollover).
